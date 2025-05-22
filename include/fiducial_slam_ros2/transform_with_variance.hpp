@@ -7,7 +7,9 @@
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Transform.h>
 #include <tf2/convert.h>
+#include <tf2/transform_datatypes.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <limits>
 
 /**
  * @brief A class that represents a transform with associated variance
@@ -78,6 +80,40 @@ TransformWithVariance averageTransforms(const TransformWithVariance& t1,
                                         const TransformWithVariance& t2);
 
 // Use the tf2::Stamped template provided by tf2 library
-// We can use tf2::Stamped<TransformWithVariance> directly
+
+// Global operators for stamped transformations
+// These are defined outside of any namespace to avoid conflicts
+
+// Create a TransformWithVariance from a basic Transform
+inline TransformWithVariance toTransformWithVariance(const tf2::Transform& t, double variance = 0.0) {
+    return TransformWithVariance(t, variance);
+}
+
+// Helper method to create a stamped transform
+inline tf2::Stamped<TransformWithVariance> createStampedTransform(
+    const TransformWithVariance& transform,
+    const std::string& frame_id,
+    const tf2::TimePoint& stamp = tf2::TimePointZero) {
+    tf2::Stamped<TransformWithVariance> stamped;
+    stamped.frame_id_ = frame_id;
+    stamped.stamp_ = stamp;
+    stamped.setData(transform);
+    return stamped;
+}
+
+// Multiplying a stamped transform with another stamped transform
+inline tf2::Stamped<TransformWithVariance> operator*(
+    const tf2::Stamped<TransformWithVariance>& lhs,
+    const tf2::Stamped<TransformWithVariance>& rhs) {
+    tf2::Stamped<TransformWithVariance> result;
+    result.frame_id_ = lhs.frame_id_;
+    result.stamp_ = lhs.stamp_;
+    
+    // Combine the transforms and add their variances
+    TransformWithVariance combined(lhs.transform * rhs.transform, lhs.variance + rhs.variance);
+    result.setData(combined);
+    
+    return result;
+}
 
 #endif // TRANSFORM_WITH_VARIANCE_HPP
