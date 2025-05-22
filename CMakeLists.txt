@@ -110,6 +110,13 @@ install(DIRECTORY
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
+
+  install(PROGRAMS
+    test/map_test.py
+    DESTINATION lib/${PROJECT_NAME}/test
+  )
+
+  ament_add_pytest_test(${PROJECT_NAME} test/map_test.py)
 endif()
 
 # Export dependencies

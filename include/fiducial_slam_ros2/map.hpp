@@ -121,6 +121,7 @@ public:
     double future_date_transforms;
     bool publish_6dof_pose;
     double multiErrorThreshold;
+    double map_systematic_error; // Added for systematic_error parameter
 
     bool isInitializingMap;
     bool readOnly;

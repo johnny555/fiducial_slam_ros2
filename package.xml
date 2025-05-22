@@ -11,9 +11,13 @@
   <license>BSD</license>
 
   <author email="jimv@mrjim.com">Jim Vaughan</author>
-  
+
   <!-- Build tool -->
   <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- Test Dependencies -->
+  <test_depend>ament_cmake_pytest</test_depend>
+  <test_depend>python3-pytest</test_depend>
 
   <!-- Dependencies -->
   <depend>rclcpp</depend>
@@ -25,11 +29,11 @@
   <depend>tf2_ros</depend>
   <depend>tf2_geometry_msgs</depend>
   <depend>geometry_msgs</depend>
-  
+
   <!-- ROS2 Service Generators -->
   <build_depend>rosidl_default_generators</build_depend>
   <exec_depend>rosidl_default_runtime</exec_depend>
-  
+
   <member_of_group>rosidl_interface_packages</member_of_group>
 
   <!-- Export -->
