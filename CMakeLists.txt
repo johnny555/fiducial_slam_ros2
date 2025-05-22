@@ -15,6 +15,10 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(fiducial_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 ##############
@@ -32,13 +36,25 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 ###########
 
 # Build the fiducial_slam_node executable
-add_executable(fiducial_slam_node src/fiducial_slam_node.cpp)
+add_executable(fiducial_slam_node 
+  src/fiducial_slam_node.cpp
+  src/transform_with_variance.cpp
+)
+
+# Include directories
+include_directories(
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
 
 # Link against dependencies
 ament_target_dependencies(fiducial_slam_node
   rclcpp
   fiducial_msgs
   std_msgs
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
+  geometry_msgs
 )
 
 # Link against the generated interfaces
