@@ -57,14 +57,20 @@ ament_target_dependencies(fiducial_slam_node
   geometry_msgs
 )
 
-# Link against the generated interfaces
-rosidl_target_interfaces(fiducial_slam_node
-  ${PROJECT_NAME} "rosidl_typesupport_cpp")
+# Link against the generated interfaces (updated to use recommended approach)
+rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
+target_link_libraries(fiducial_slam_node "${cpp_typesupport_target}")
 
 # Install targets
 install(TARGETS
   fiducial_slam_node
   DESTINATION lib/${PROJECT_NAME}
+)
+
+# Install launch files
+install(DIRECTORY
+  launch/
+  DESTINATION share/${PROJECT_NAME}/launch
 )
 
 if(BUILD_TESTING)
