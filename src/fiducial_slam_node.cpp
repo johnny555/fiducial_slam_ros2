@@ -7,6 +7,7 @@
 #include <fiducial_slam_ros2/srv/add_fiducial.hpp>
 #include <fiducial_slam_ros2/transform_with_variance.hpp>
 #include <fiducial_slam_ros2/helpers.hpp>
+#include <fiducial_slam_ros2/map.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 
@@ -18,24 +19,6 @@ public:
   {
     RCLCPP_INFO(this->get_logger(), "Starting fiducial_slam_ros2 node");
     
-    // Create a transform broadcaster for publishing transforms
-    tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
-    
-    // Publisher for robot pose
-    robot_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
-      "fiducial_pose", 10);
-    
-    // Simple subscription to the fiducial_transforms topic
-    fiducial_sub_ = this->create_subscription<fiducial_msgs::msg::FiducialTransformArray>(
-      "fiducial_transforms", 1,
-      std::bind(&FiducialSlam::fiducialCallback, this, std::placeholders::_1));
-    
-    // Service to add fiducial to the map
-    add_fiducial_service_ = this->create_service<fiducial_slam_ros2::srv::AddFiducial>(
-      "add_fiducial",
-      std::bind(&FiducialSlam::addFiducialCallback, this, 
-                std::placeholders::_1, std::placeholders::_2));
-                
     // Initialize parameters
     map_frame_ = this->declare_parameter<std::string>("map_frame", "map");
     odom_frame_ = this->declare_parameter<std::string>("odom_frame", "odom");
@@ -44,6 +27,14 @@ public:
     RCLCPP_INFO(this->get_logger(), "Using map_frame: %s", map_frame_.c_str());
     RCLCPP_INFO(this->get_logger(), "Using odom_frame: %s", odom_frame_.c_str());
     RCLCPP_INFO(this->get_logger(), "Using base_frame: %s", base_frame_.c_str());
+    
+    // Create the map instance
+    map_ = std::make_shared<Map>(shared_from_this());
+    
+    // Simple subscription to the fiducial_transforms topic
+    fiducial_sub_ = this->create_subscription<fiducial_msgs::msg::FiducialTransformArray>(
+      "fiducial_transforms", 1,
+      std::bind(&FiducialSlam::fiducialCallback, this, std::placeholders::_1));
   }
 
 private:
@@ -59,51 +50,36 @@ private:
       return;
     }
     
-    // In a full implementation, we would:
-    // 1. Update the map with detected fiducials
-    // 2. Estimate the robot pose
-    // 3. Publish the transforms
+    // Convert fiducial transforms to observations
+    std::vector<Observation> observations;
     
-    // Just as a stub, let's publish a simple transform for the first fiducial
-    if (!msg->transforms.empty()) {
-      // Create a transform with variance
-      auto transform = msg->transforms[0].transform;
-      TransformWithVariance tv(transform, 0.1); // 0.1 is a placeholder variance
+    for (const auto &transform : msg->transforms) {
+      // Create a TransformWithVariance for this fiducial
+      TransformWithVariance tv(transform.transform, 0.1); // 0.1 is a placeholder variance
       
-      // Create a pose message for publishing
-      auto pose = tv.toPose(map_frame_, this->now());
+      tf2::Stamped<TransformWithVariance> camera_fiducial;
+      camera_fiducial.frame_id_ = msg->header.frame_id;
+      camera_fiducial.stamp_ = tf2::TimePointZero;
+      camera_fiducial.setData(tv);
       
-      // Publish the robot pose
-      robot_pose_pub_->publish(pose);
+      // Create an observation
+      observations.emplace_back(transform.fiducial_id, camera_fiducial);
       
-      // Log info
-      RCLCPP_INFO(this->get_logger(), "Published robot pose from fiducial %d", 
-                  msg->transforms[0].fiducial_id);
+      RCLCPP_DEBUG(this->get_logger(), "Adding observation for fiducial %d", transform.fiducial_id);
     }
-  }
-  
-  // Callback for the AddFiducial service
-  void addFiducialCallback(
-    const std::shared_ptr<fiducial_slam_ros2::srv::AddFiducial::Request> request,
-    std::shared_ptr<fiducial_slam_ros2::srv::AddFiducial::Response> response)
-  {
-    RCLCPP_INFO(this->get_logger(), 
-                "Received request to add fiducial %d to the map", 
-                request->fiducial_id);
     
-    // In the full implementation, this would add a new fiducial to the map
+    // Update the map with these observations
+    map_->update(observations, this->now());
   }
   
   // Member variables
   std::string map_frame_;
   std::string odom_frame_;
   std::string base_frame_;
+  std::shared_ptr<Map> map_;
   
-  // Publishers, subscribers and services
-  rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr robot_pose_pub_;
-  std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+  // Subscribers
   rclcpp::Subscription<fiducial_msgs::msg::FiducialTransformArray>::SharedPtr fiducial_sub_;
-  rclcpp::Service<fiducial_slam_ros2::srv::AddFiducial>::SharedPtr add_fiducial_service_;
 };
 
 int main(int argc, char *argv[])

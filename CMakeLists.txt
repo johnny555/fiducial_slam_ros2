@@ -19,7 +19,10 @@ find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
+find_package(std_srvs REQUIRED)
+find_package(OpenCV REQUIRED)
 
 ##############
 ## Services ##
@@ -39,6 +42,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 add_executable(fiducial_slam_node 
   src/fiducial_slam_node.cpp
   src/transform_with_variance.cpp
+  src/map.cpp
 )
 
 # Include directories
@@ -55,6 +59,9 @@ ament_target_dependencies(fiducial_slam_node
   tf2_ros
   tf2_geometry_msgs
   geometry_msgs
+  visualization_msgs
+  std_srvs
+  OpenCV
 )
 
 # Link against the generated interfaces (updated to use recommended approach)
