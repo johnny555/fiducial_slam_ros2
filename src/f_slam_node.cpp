@@ -1,6 +1,7 @@
 // f_slam_node.cpp
 // GTSAM-based fiducial SLAM implementation
 
+#include <boost/make_shared.hpp>
 #include <memory>
 #include <chrono>
 #include <unordered_map>
@@ -28,6 +29,95 @@
 #include <gtsam/nonlinear/LevenbergMarquardtParams.h>
 #include <gtsam/nonlinear/Values.h>
 #include <gtsam/linear/NoiseModel.h>
+// Add this include for custom factors
+#include <gtsam/nonlinear/NonlinearFactor.h>
+
+// Custom factor to constrain roll and pitch
+class RollPitchConstraintFactor : public gtsam::NoiseModelFactor1<gtsam::Pose3> {
+private:
+  double max_roll_pitch_; // Maximum allowed roll/pitch in radians
+
+public:
+  RollPitchConstraintFactor(gtsam::Key key, double max_roll_pitch_degrees, 
+                           const gtsam::SharedNoiseModel& noise_model)
+    : NoiseModelFactor1<gtsam::Pose3>(noise_model, key),
+      max_roll_pitch_(max_roll_pitch_degrees * M_PI / 180.0) {}
+
+  gtsam::Vector evaluateError(const gtsam::Pose3& pose,
+                             boost::optional<gtsam::Matrix&> H = boost::none) const override {
+    // Extract roll, pitch, yaw from the pose
+    gtsam::Vector3 rpy = pose.rotation().rpy();
+    double roll = rpy(0);
+    double pitch = rpy(1);
+    
+    // Create error vector - penalize roll and pitch when they exceed limits
+    gtsam::Vector2 error;
+    
+    // Soft constraint using exponential penalty beyond the limit
+    if (std::abs(roll) > max_roll_pitch_) {
+      error(0) = std::abs(roll) - max_roll_pitch_;
+      if (roll < 0) error(0) = -error(0);
+    } else {
+      error(0) = 0.0;
+    }
+    
+    if (std::abs(pitch) > max_roll_pitch_) {
+      error(1) = std::abs(pitch) - max_roll_pitch_;
+      if (pitch < 0) error(1) = -error(1);
+    } else {
+      error(1) = 0.0;
+    }
+    
+    // Compute Jacobian if requested
+    if (H) {
+      // Simplified Jacobian - you might want to compute the exact one
+      *H = gtsam::Matrix::Zero(2, 6);
+      (*H)(0, 3) = 1.0; // d(error_roll)/d(roll)
+      (*H)(1, 4) = 1.0; // d(error_pitch)/d(pitch)
+    }
+    
+    return error;
+  }
+};
+
+// Custom factor to constrain Z position relative to initial height
+class ZConstraintFactor : public gtsam::NoiseModelFactor1<gtsam::Pose3> {
+private:
+  double reference_z_;     // Reference Z position (typically initial robot Z)
+  double max_z_deviation_; // Maximum allowed deviation in meters
+
+public:
+  ZConstraintFactor(gtsam::Key key, double reference_z, double max_z_deviation_meters, 
+                   const gtsam::SharedNoiseModel& noise_model)
+    : NoiseModelFactor1<gtsam::Pose3>(noise_model, key),
+      reference_z_(reference_z),
+      max_z_deviation_(max_z_deviation_meters) {}
+
+  gtsam::Vector evaluateError(const gtsam::Pose3& pose,
+                             boost::optional<gtsam::Matrix&> H = boost::none) const override {
+    double current_z = pose.z();
+    double z_error = current_z - reference_z_;
+    
+    // Create error vector - penalize Z when it exceeds limits
+    gtsam::Vector1 error;
+    
+    // Soft constraint using penalty beyond the limit
+    if (std::abs(z_error) > max_z_deviation_) {
+      error(0) = std::abs(z_error) - max_z_deviation_;
+      if (z_error < 0) error(0) = -error(0);
+    } else {
+      error(0) = 0.0;
+    }
+    
+    // Compute Jacobian if requested
+    if (H) {
+      *H = gtsam::Matrix::Zero(1, 6);
+      (*H)(0, 2) = 1.0; // d(error_z)/d(z)
+    }
+    
+    return error;
+  }
+};
 
 using namespace gtsam;
 
@@ -45,7 +135,14 @@ public:
     declare_parameter("camera_frame", "camera_link");
     declare_parameter("mapping_mode", true);
     declare_parameter("fiducial_map_file", "fiducial_map.txt");
-    declare_parameter("optimization_frequency", 2.0);
+    declare_parameter("optimization_frequency", 1.0);
+    declare_parameter("max_roll_pitch_degrees", 2.0);
+    declare_parameter("max_z_deviation_meters", 0.01);
+    declare_parameter("fiducial_position_noise", 0.1);
+    declare_parameter("fiducial_rotation_noise", 0.2);
+    declare_parameter("fiducial_prior_position_noise", 0.05);
+    declare_parameter("fiducial_prior_rotation_noise", 0.1);
+    declare_parameter("min_observations_for_init", 3);  // Require multiple observations before trusting
     
     // Get parameters
     map_frame_ = get_parameter("map_frame").as_string();
@@ -55,6 +152,19 @@ public:
     mapping_mode_ = get_parameter("mapping_mode").as_bool();
     fiducial_map_file_ = get_parameter("fiducial_map_file").as_string();
     optimization_frequency_ = get_parameter("optimization_frequency").as_double();
+    max_roll_pitch_degrees_ = get_parameter("max_roll_pitch_degrees").as_double();
+    max_z_deviation_meters_ = get_parameter("max_z_deviation_meters").as_double();
+    double fiducial_pos_noise = get_parameter("fiducial_position_noise").as_double();
+    double fiducial_rot_noise = get_parameter("fiducial_rotation_noise").as_double();
+    double fiducial_prior_pos_noise = get_parameter("fiducial_prior_position_noise").as_double();
+    double fiducial_prior_rot_noise = get_parameter("fiducial_prior_rotation_noise").as_double();
+    min_observations_for_init_ = get_parameter("min_observations_for_init").as_int();
+    
+    // Store noise parameters
+    fiducial_pos_noise_ = fiducial_pos_noise;
+    fiducial_rot_noise_ = fiducial_rot_noise;
+    fiducial_prior_pos_noise_ = fiducial_prior_pos_noise;
+    fiducial_prior_rot_noise_ = fiducial_prior_rot_noise;
     
     RCLCPP_INFO(this->get_logger(), "Mode: %s", mapping_mode_ ? "MAPPING" : "LOCALIZATION");
     
@@ -112,28 +222,47 @@ private:
     auto odom_noise_vector = (Vector(6) << 0.05, 0.05, 0.05, 0.05, 0.05, 0.05).finished();
     odometry_noise_ = noiseModel::Diagonal::Variances(odom_noise_vector);
     
-    // Fiducial observation noise - tighter constraints
-    auto fiducial_noise_vector = (Vector(6) << 0.01, 0.01, 0.01, 0.02, 0.02, 0.02).finished();
+    // Fiducial observation noise - use configurable parameters
+    auto fiducial_noise_vector = (Vector(6) << 
+      fiducial_pos_noise_, fiducial_pos_noise_, fiducial_pos_noise_,
+      fiducial_rot_noise_, fiducial_rot_noise_, fiducial_rot_noise_).finished();
     fiducial_noise_ = noiseModel::Diagonal::Variances(fiducial_noise_vector);
     
     // Prior noise for first pose - very tight
     auto prior_noise_vector = (Vector(6) << 0.001, 0.001, 0.001, 0.001, 0.001, 0.001).finished();
     prior_noise_ = noiseModel::Diagonal::Variances(prior_noise_vector);
     
-    // Fiducial anchor noise - very strong constraints to prevent drift
-    auto fiducial_prior_vector = (Vector(6) << 0.001, 0.001, 0.001, 0.01, 0.01, 0.01).finished();
+    // Fiducial anchor noise - use configurable parameters
+    auto fiducial_prior_vector = (Vector(6) << 
+      fiducial_prior_pos_noise_, fiducial_prior_pos_noise_, fiducial_prior_pos_noise_,
+      fiducial_prior_rot_noise_, fiducial_prior_rot_noise_, fiducial_prior_rot_noise_).finished();
     fiducial_prior_noise_ = noiseModel::Diagonal::Variances(fiducial_prior_vector);
+    
+    // Roll/pitch constraint noise - strong constraint
+    auto roll_pitch_noise_vector = (Vector(2) << 0.1, 0.1).finished();
+    roll_pitch_constraint_noise_ = noiseModel::Diagonal::Variances(roll_pitch_noise_vector);
+    
+    // Z constraint noise - strong constraint for flat surface
+    auto z_constraint_noise_vector = (Vector(1) << 0.01).finished();
+    z_constraint_noise_ = noiseModel::Diagonal::Variances(z_constraint_noise_vector);
     
     // Initialize first robot pose
     current_robot_key_ = Symbol('x', 0);
     Pose3 initial_pose = Pose3::Identity();
     
+    // Store reference Z for constraints
+    reference_z_ = initial_pose.z();
+    
     // Add prior factor for first pose
     graph_.add(PriorFactor<Pose3>(current_robot_key_, initial_pose, prior_noise_));
-    initial_estimate_.insert(current_robot_key_, initial_pose);
+    current_estimate_.insert(current_robot_key_, initial_pose);  // Add to current_estimate_ instead of initial_estimate_
     
     pose_counter_ = 1;
     last_optimization_time_ = now();
+    
+    // Add constraints for the initial pose
+    addRollPitchConstraint(current_robot_key_);
+    addZConstraint(current_robot_key_);
   }
   
   void fiducialCallback(const fiducial_msgs::msg::FiducialTransformArray::SharedPtr msg) {
@@ -156,15 +285,25 @@ private:
     // Convert ROS transform to GTSAM Pose3
     Pose3 camera_to_fiducial = rosToPose3(transform.transform);
     
-    // If this is a new fiducial and we're in mapping mode, initialize it
+    // Track observations for each fiducial
+    fiducial_observations_[fiducial_id]++;
+    
+    // If this is a new fiducial and we're in mapping mode
     if (mapping_mode_ && known_fiducials_.find(fiducial_id) == known_fiducials_.end()) {
-      initializeNewFiducial(fiducial_id, camera_to_fiducial, header.stamp);
+      // Only initialize after seeing the fiducial multiple times to reduce noise impact
+      if (fiducial_observations_[fiducial_id] >= min_observations_for_init_) {
+        initializeNewFiducial(fiducial_id, camera_to_fiducial, header.stamp);
+      } else {
+        RCLCPP_DEBUG(this->get_logger(), "Fiducial %d seen %d/%d times before initialization", 
+                     fiducial_id, fiducial_observations_[fiducial_id], min_observations_for_init_);
+        return;  // Don't add observation factor yet
+      }
     }
     
     // Add observation factor if fiducial is known
     if (known_fiducials_.find(fiducial_id) != known_fiducials_.end()) {
       // Get transform from base_link to camera
-      Pose3 base_to_camera = Pose3::Identity(); // Default assumption
+      Pose3 base_to_camera = Pose3::Identity();
       
       try {
         if (tf_buffer_->canTransform(base_frame_, camera_frame_, rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1))) {
@@ -176,21 +315,50 @@ private:
         RCLCPP_DEBUG(this->get_logger(), "Using identity for base->camera transform: %s", ex.what());
       }
       
-      // The observation factor relates: 
-      // robot_pose_in_map * base_to_camera * camera_to_fiducial = fiducial_pose_in_map
-      // We can combine base_to_camera * camera_to_fiducial into a single relative transform
+      // Adaptive noise based on distance (farther detections are noisier)
+      double distance = camera_to_fiducial.translation().norm();
+      double distance_factor = std::max(1.0, distance / 2.0);  // Increase noise with distance
+      
+      // Create adaptive noise model
+      auto adaptive_noise_vector = (Vector(6) << 
+        fiducial_pos_noise_ * distance_factor, 
+        fiducial_pos_noise_ * distance_factor, 
+        fiducial_pos_noise_ * distance_factor,
+        fiducial_rot_noise_ * distance_factor, 
+        fiducial_rot_noise_ * distance_factor, 
+        fiducial_rot_noise_ * distance_factor).finished();
+      auto adaptive_noise = noiseModel::Diagonal::Variances(adaptive_noise_vector);
+      
       Pose3 base_to_fiducial = base_to_camera * camera_to_fiducial;
       
-      // Add factor: robot_pose + base_to_fiducial = fiducial_pose
+      // Add factor with adaptive noise
       graph_.add(BetweenFactor<Pose3>(current_robot_key_, fiducial_key, 
-                                      base_to_fiducial, fiducial_noise_));
+                                      base_to_fiducial, adaptive_noise));
       
-      RCLCPP_DEBUG(this->get_logger(), "Added observation factor for fiducial %d", fiducial_id);
+      RCLCPP_DEBUG(this->get_logger(), "Added observation factor for fiducial %d (distance: %.2f, noise factor: %.2f)", 
+                   fiducial_id, distance, distance_factor);
     }
   }
   
+  void addRollPitchConstraint(const Symbol& robot_key) {
+    auto constraint = boost::make_shared<RollPitchConstraintFactor>(
+      robot_key, max_roll_pitch_degrees_, roll_pitch_constraint_noise_);
+    graph_.add(constraint);
+    
+    RCLCPP_DEBUG(this->get_logger(), "Added roll/pitch constraint for pose %zu", static_cast<size_t>(robot_key));
+  }
+  
+  void addZConstraint(const Symbol& robot_key) {
+    auto constraint = boost::make_shared<ZConstraintFactor>(
+      robot_key, reference_z_, max_z_deviation_meters_, z_constraint_noise_);
+    graph_.add(constraint);
+    
+    RCLCPP_DEBUG(this->get_logger(), "Added Z constraint for pose %zu (ref: %.3f, max dev: %.3f)", 
+                 static_cast<size_t>(robot_key), reference_z_, max_z_deviation_meters_);
+  }
+  
   void initializeNewFiducial(int fiducial_id, const Pose3& camera_to_fiducial, 
-                           const rclcpp::Time& stamp) {
+                           const rclcpp::Time& /* stamp */) {
     // Initialize fiducials in map frame, assuming robot starts at map origin
     // This avoids drift issues that occur when initializing in odom frame
     
@@ -252,7 +420,13 @@ private:
     if (last_odom_time_.nanoseconds() == 0) {
       last_odom_time_ = msg->header.stamp;
       last_odom_pose_ = rosToPose3(msg->pose.pose);
-      has_received_odom_ = true;  // Mark that we've received odometry data
+      has_received_odom_ = true;
+      
+      // Update reference Z from first odometry message if available
+      if (reference_z_ == 0.0) {
+        reference_z_ = last_odom_pose_.z();
+        RCLCPP_INFO(this->get_logger(), "Set reference Z to %.3f from first odometry", reference_z_);
+      }
       return;
     }
     
@@ -266,6 +440,10 @@ private:
     // Add odometry factor
     graph_.add(BetweenFactor<Pose3>(current_robot_key_, new_robot_key, 
                                     odom_delta, odometry_noise_));
+    
+    // Add constraints for the new pose
+    addRollPitchConstraint(new_robot_key);
+    addZConstraint(new_robot_key);
     
     // Initialize new pose estimate
     if (current_estimate_.exists(current_robot_key_)) {
@@ -286,7 +464,7 @@ private:
     RCLCPP_DEBUG(this->get_logger(), "Optimization callback started");
     
     // Only optimize if we have received at least one odometry message and have sufficient data
-    if (graph_.empty() || initial_estimate_.empty() || !has_received_odom_) {
+    if (graph_.empty() || current_estimate_.empty() || !has_received_odom_) {
       RCLCPP_DEBUG(this->get_logger(), "Skipping optimization - insufficient data");
       return;
     }
@@ -304,9 +482,13 @@ private:
       // Merge initial estimate with current estimate for optimization
       Values combined_estimate = current_estimate_;
       
+      // Only add values from initial_estimate_ that don't already exist in current_estimate_
       for (const auto& key_value : initial_estimate_) {
         if (!combined_estimate.exists(key_value.key)) {
           combined_estimate.insert(key_value.key, key_value.value);
+        } else {
+          // Update existing values from initial_estimate_ (for new poses)
+          combined_estimate.update(key_value.key, key_value.value);
         }
       }
       
@@ -555,15 +737,23 @@ private:
         Pose3 fiducial_pose = Pose3(Rot3::RzRyRx(rz, ry, rx), Point3(x, y, z));
         
         Symbol fiducial_key = Symbol('l', fiducial_id);
-        initial_estimate_.insert(fiducial_key, fiducial_pose);
+        
+        // In localization mode, add fiducials to current_estimate_ with strong priors
+        current_estimate_.insert(fiducial_key, fiducial_pose);
         known_fiducials_.insert(fiducial_id);
         
-        RCLCPP_INFO(this->get_logger(), "Loaded fiducial %d from map file", fiducial_id);
+        // Add strong prior factor to fix these fiducials in place during localization
+        // This prevents them from being optimized and causing instabilities
+        auto fixed_fiducial_noise = noiseModel::Diagonal::Variances(
+          (Vector(6) << 0.001, 0.001, 0.001, 0.001, 0.001, 0.001).finished());
+        graph_.add(PriorFactor<Pose3>(fiducial_key, fiducial_pose, fixed_fiducial_noise));
+        
+        RCLCPP_INFO(this->get_logger(), "Loaded fiducial %d from map file with strong prior", fiducial_id);
       }
     }
     
     file.close();
-    RCLCPP_INFO(this->get_logger(), "Loaded %zu fiducials from map file", known_fiducials_.size());
+    RCLCPP_INFO(this->get_logger(), "Loaded %zu fiducials from map file in localization mode", known_fiducials_.size());
   }
   
   void saveFiducialMap() {
@@ -633,6 +823,16 @@ private:
   bool mapping_mode_;
   std::string fiducial_map_file_;
   double optimization_frequency_;
+  double max_roll_pitch_degrees_;
+  double max_z_deviation_meters_;
+  double reference_z_ = 0.0;  // Reference Z height for constraints
+  
+  // Noise parameters
+  double fiducial_pos_noise_;
+  double fiducial_rot_noise_;
+  double fiducial_prior_pos_noise_;
+  double fiducial_prior_rot_noise_;
+  int min_observations_for_init_;
   
   // TF components
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
@@ -650,11 +850,14 @@ private:
   noiseModel::Diagonal::shared_ptr fiducial_noise_;
   noiseModel::Diagonal::shared_ptr prior_noise_;
   noiseModel::Diagonal::shared_ptr fiducial_prior_noise_;
+  noiseModel::Diagonal::shared_ptr roll_pitch_constraint_noise_;
+  noiseModel::Diagonal::shared_ptr z_constraint_noise_;
   
   // State tracking
   Symbol current_robot_key_;
   int pose_counter_;
   std::set<int> known_fiducials_;
+  std::unordered_map<int, int> fiducial_observations_;  // Track observation count per fiducial
   
   // Odometry tracking
   rclcpp::Time last_odom_time_{0, 0, RCL_ROS_TIME};
