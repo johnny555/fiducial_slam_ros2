@@ -15,6 +15,8 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(fiducial_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
@@ -23,6 +25,7 @@ find_package(visualization_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(OpenCV REQUIRED)
+find_package(GTSAM REQUIRED)
 
 ##############
 ## Services ##
@@ -45,6 +48,11 @@ add_executable(fiducial_slam_node
   src/map.cpp
 )
 
+# Build the new f_slam executable with GTSAM
+add_executable(f_slam 
+  src/f_slam_node.cpp
+)
+
 # Include directories
 include_directories(
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -64,6 +72,24 @@ ament_target_dependencies(fiducial_slam_node
   OpenCV
 )
 
+# Link against dependencies for f_slam
+ament_target_dependencies(f_slam
+  rclcpp
+  fiducial_msgs
+  std_msgs
+  nav_msgs
+  visualization_msgs
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
+  geometry_msgs
+  visualization_msgs
+  std_srvs
+)
+
+# Link GTSAM library to f_slam
+target_link_libraries(f_slam gtsam)
+
 # Link against the generated interfaces (updated to use recommended approach)
 rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
 target_link_libraries(fiducial_slam_node "${cpp_typesupport_target}")
@@ -71,6 +97,7 @@ target_link_libraries(fiducial_slam_node "${cpp_typesupport_target}")
 # Install targets
 install(TARGETS
   fiducial_slam_node
+  f_slam
   DESTINATION lib/${PROJECT_NAME}
 )
 

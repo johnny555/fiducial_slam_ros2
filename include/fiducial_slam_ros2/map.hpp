@@ -137,6 +137,8 @@ public:
     rclcpp::Time tfPublishTime;
     geometry_msgs::msg::TransformStamped poseTf;
 
+    tf2::Stamped<TransformWithVariance> previousCameraPose;
+
     std::map<int, Fiducial> fiducials;
     int fiducialToAdd;
 
@@ -148,7 +150,7 @@ public:
                    tf2::Stamped<TransformWithVariance> &cameraPose);
     void updateMap(const std::vector<Observation> &obs, const rclcpp::Time &time,
                    const tf2::Stamped<TransformWithVariance> &cameraPose);
-    void handleAddFiducial(const std::vector<Observation> &obs);
+    void handleAddFiducial(const std::vector<Observation> &obs, const rclcpp::Time &time);
 
     bool loadMap();
     bool loadMap(std::string filename);

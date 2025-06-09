@@ -35,6 +35,7 @@
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Vector3.h>
 #include <string>
+#include <cmath>
 
 #include <std_msgs/msg/color_rgba.hpp>
 #include <std_msgs/msg/string.hpp>
@@ -81,6 +82,9 @@ Map::Map(rclcpp::Node::SharedPtr node) : node(node), logger(node->get_logger()) 
     havePose = false;
     fiducialToAdd = -1;
 
+    // Initialize previous camera pose
+    previousCameraPose.variance = 0.0;
+    
     tfBuffer = std::make_unique<tf2_ros::Buffer>(node->get_clock());
     listener = std::make_shared<tf2_ros::TransformListener>(*tfBuffer);
     broadcaster = std::make_shared<tf2_ros::TransformBroadcaster>(node);
@@ -175,7 +179,7 @@ void Map::update(std::vector<Observation> &obs, const rclcpp::Time &time) {
     } else {
         tf2::Stamped<TransformWithVariance> cameraPose;
         cameraPose.frame_id_ = mapFrame;
-        cameraPose.stamp_ = tf2::TimePointZero;
+        cameraPose.stamp_ = tf2_ros::fromMsg(time);
         cameraPose.variance = 0.0;
 
         if (updatePose(obs, time, cameraPose) > 0 && obs.size() > 1 && !readOnly) {
@@ -243,7 +247,7 @@ void Map::update(std::vector<Observation> &obs, const rclcpp::Time &time) {
         }
     }
 
-    handleAddFiducial(obs);
+    handleAddFiducial(obs, time);
     publishMap();
 }
 
@@ -280,7 +284,7 @@ void Map::autoInit(const std::vector<Observation> &obs, const rclcpp::Time &time
         
         tf2::Stamped<TransformWithVariance> T_mapFid;
         T_mapFid.frame_id_ = mapFrame;
-        T_mapFid.stamp_ = tf2::TimePointZero;
+        T_mapFid.stamp_ = tf2_ros::fromMsg(time);
         
         // Initialize the map with this fiducial at the origin
         TransformWithVariance tv(tf2::Transform(tf2::Quaternion(0, 0, 0, 1), tf2::Vector3(0, 0, 0)), 0.0);
@@ -304,7 +308,7 @@ void Map::autoInit(const std::vector<Observation> &obs, const rclcpp::Time &time
                     // Create a new stamped transform using the operator* and set its frame and time
                     tf2::Stamped<TransformWithVariance> T_mapFid2 = T_mapCam * o2.T_camFid;
                     T_mapFid2.frame_id_ = mapFrame;
-                    T_mapFid2.stamp_ = tf2::TimePointZero;
+                    T_mapFid2.stamp_ = tf2_ros::fromMsg(time);
                     
                     fiducials[o2.fid] = Fiducial(o2.fid, T_mapFid2);
                     RCLCPP_INFO(logger, "Added initial fiducial %d to map with pose %f %f %f", 
@@ -331,6 +335,7 @@ int Map::updatePose(std::vector<Observation> &obs, const rclcpp::Time &time,
     if (obs.size() == 0) {
         return 0;
     }
+
 
     if (lookupTransform(obs[0].T_camFid.frame_id_, baseFrame, time, T_camBase.transform)) {
         tf2::Vector3 c = T_camBase.transform.getOrigin();
@@ -386,12 +391,15 @@ int Map::updatePose(std::vector<Observation> &obs, const rclcpp::Time &time,
             if (std::isnan(position.x()) || std::isnan(position.y()) || std::isnan(position.z())) {
                 valid = false;
                 RCLCPP_WARN(logger, "Skipping NAN estimate");
-            } else if (position.z() > 1.0) {
+            } else if (position.z() > 10.0) {
                 valid = false;
                 RCLCPP_WARN(logger, "Skipping estimate with high Z");
-            } else if (std::abs(roll) > 0.5 || std::abs(pitch) > 0.5) {
+            //} else if (std::abs(std::abs(roll) - M_PI) > 1.5 || std::abs(std::abs(pitch) - M_PI) > 1.5) {
+              //  valid = false;
+              //  RCLCPP_WARN(logger, "Skipping estimate with high roll/pitch");
+            } else if (p.variance > 10.0) {
                 valid = false;
-                RCLCPP_WARN(logger, "Skipping estimate with high roll/pitch");
+                RCLCPP_WARN(logger, "Skipping estimate with high variance: %f", p.variance);
             }
 
             if (valid) {
@@ -419,6 +427,30 @@ int Map::updatePose(std::vector<Observation> &obs, const rclcpp::Time &time,
         RCLCPP_INFO(logger, "No good estimates");
         return 0;
     }
+
+    // Apply temporal smoothing to reduce pose jumps
+    if (previousCameraPose.variance > 0.0) {
+        double smoothingFactor = 0.0; // Adjust this for more/less smoothing (0.0 = no smoothing, 1.0 = no update)
+        
+        // Smooth position
+        tf2::Vector3 currentPos = cameraPose.transform.getOrigin();
+        tf2::Vector3 previousPos = previousCameraPose.transform.getOrigin();
+        tf2::Vector3 smoothedPos = previousPos.lerp(currentPos, smoothingFactor);
+        
+        // Smooth rotation using slerp
+        tf2::Quaternion currentRot = cameraPose.transform.getRotation();
+        tf2::Quaternion previousRot = previousCameraPose.transform.getRotation();
+        tf2::Quaternion smoothedRot = previousRot.slerp(currentRot, smoothingFactor);
+        
+        // Apply smoothed transform
+        cameraPose.transform.setOrigin(smoothedPos);
+        cameraPose.transform.setRotation(smoothedRot);
+        
+        RCLCPP_DEBUG(logger, "Applied pose smoothing");
+    }
+    
+    // Store current pose as previous for next iteration
+    previousCameraPose = cameraPose;
 
     // Publish updated transform and update the robot's position in the map
     RCLCPP_INFO(logger, "Found %d good estimates", numEsts);
@@ -493,7 +525,7 @@ bool Map::lookupTransform(const std::string &from, const std::string &to,
 }
 
 // Implementation for handleAddFiducial
-void Map::handleAddFiducial(const std::vector<Observation> &obs) {
+void Map::handleAddFiducial(const std::vector<Observation> &obs, const rclcpp::Time &time) {
     if (fiducialToAdd == -1) {
         return;
     }
@@ -509,7 +541,7 @@ void Map::handleAddFiducial(const std::vector<Observation> &obs) {
             // Try to estimate the camera pose
             tf2::Stamped<TransformWithVariance> cameraPose;
             cameraPose.frame_id_ = mapFrame;
-            cameraPose.stamp_ = tf2::TimePointZero;
+            cameraPose.stamp_ = tf2_ros::fromMsg(time);
             cameraPose.variance = 0.0;
             
             if (updatePose(const_cast<std::vector<Observation>&>(obs), node->now(), cameraPose) > 0) {
