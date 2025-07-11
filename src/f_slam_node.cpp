@@ -228,8 +228,8 @@ private:
       fiducial_rot_noise_, fiducial_rot_noise_, fiducial_rot_noise_).finished();
     fiducial_noise_ = noiseModel::Diagonal::Variances(fiducial_noise_vector);
     
-    // Prior noise for first pose - very tight
-    auto prior_noise_vector = (Vector(6) << 0.001, 0.001, 0.001, 0.001, 0.001, 0.001).finished();
+    // Prior noise for first pose - use loose noise until map is initialized
+    auto prior_noise_vector = (Vector(6) << 1.0, 1.0, 1.0, 0.1, 0.1, 1.0).finished();
     prior_noise_ = noiseModel::Diagonal::Variances(prior_noise_vector);
     
     // Fiducial anchor noise - use configurable parameters
@@ -246,23 +246,16 @@ private:
     auto z_constraint_noise_vector = (Vector(1) << 0.01).finished();
     z_constraint_noise_ = noiseModel::Diagonal::Variances(z_constraint_noise_vector);
     
-    // Initialize first robot pose
+    // Initialize first robot pose - don't fix it until we see the first fiducial
     current_robot_key_ = Symbol('x', 0);
-    Pose3 initial_pose = Pose3::Identity();
-    
-    // Store reference Z for constraints
-    reference_z_ = initial_pose.z();
-    
-    // Add prior factor for first pose
-    graph_.add(PriorFactor<Pose3>(current_robot_key_, initial_pose, prior_noise_));
-    current_estimate_.insert(current_robot_key_, initial_pose);  // Add to current_estimate_ instead of initial_estimate_
-    
     pose_counter_ = 1;
     last_optimization_time_ = now();
+    map_initialized_ = false;
     
-    // Add constraints for the initial pose
-    addRollPitchConstraint(current_robot_key_);
-    addZConstraint(current_robot_key_);
+    // Don't add the robot pose to the graph yet - wait for first fiducial observation
+    // This allows the map origin to be established at the robot's location when it first sees a landmark
+    
+    RCLCPP_INFO(this->get_logger(), "GTSAM initialized - waiting for first fiducial observation to establish map origin");
   }
   
   void fiducialCallback(const fiducial_msgs::msg::FiducialTransformArray::SharedPtr msg) {
@@ -287,6 +280,20 @@ private:
     
     // Track observations for each fiducial
     fiducial_observations_[fiducial_id]++;
+    
+    // If the map hasn't been initialized yet, we can't process observations
+    if (!map_initialized_) {
+      // Check if this is a new fiducial that we should initialize the map with
+      if (mapping_mode_ && known_fiducials_.find(fiducial_id) == known_fiducials_.end()) {
+        if (fiducial_observations_[fiducial_id] >= min_observations_for_init_) {
+          initializeNewFiducial(fiducial_id, camera_to_fiducial, header.stamp);
+        } else {
+          RCLCPP_DEBUG(this->get_logger(), "Fiducial %d seen %d/%d times before map initialization", 
+                       fiducial_id, fiducial_observations_[fiducial_id], min_observations_for_init_);
+        }
+      }
+      return;  // Don't process observations until map is initialized
+    }
     
     // If this is a new fiducial and we're in mapping mode
     if (mapping_mode_ && known_fiducials_.find(fiducial_id) == known_fiducials_.end()) {
@@ -317,7 +324,8 @@ private:
       
       // Adaptive noise based on distance (farther detections are noisier)
       double distance = camera_to_fiducial.translation().norm();
-      double distance_factor = std::max(1.0, distance / 2.0);  // Increase noise with distance
+      // Scale factor to achieve ~0.3m noise at 3m distance (0.3/0.1 = 3.0 factor at 3m)
+      double distance_factor = std::max(1.0, 1.0 + (distance - 1.0) * 0.67);  // Linear scaling from 1.0 at 1m to 3.0 at 3m
       
       // Create adaptive noise model
       auto adaptive_noise_vector = (Vector(6) << 
@@ -359,27 +367,30 @@ private:
   
   void initializeNewFiducial(int fiducial_id, const Pose3& camera_to_fiducial, 
                            const rclcpp::Time& /* stamp */) {
-    // Initialize fiducials in map frame, assuming robot starts at map origin
-    // This avoids drift issues that occur when initializing in odom frame
-    
     try {
-      // Get current robot pose estimate in map frame
+      // If this is the first fiducial we're seeing, establish the map origin at the current robot location
+      if (!map_initialized_) {
+        initializeMapOrigin(fiducial_id, camera_to_fiducial);
+        return;
+      }
+      
+      // For subsequent fiducials, initialize them relative to the current robot pose estimate
       Pose3 robot_pose_in_map;
       
       if (current_estimate_.exists(current_robot_key_)) {
         // Use the current optimized robot pose
         robot_pose_in_map = current_estimate_.at<Pose3>(current_robot_key_);
+      } else if (initial_estimate_.exists(current_robot_key_)) {
+        // Fall back to initial estimate if not optimized yet
+        robot_pose_in_map = initial_estimate_.at<Pose3>(current_robot_key_);
       } else {
-        // Robot hasn't been optimized yet, assume it's at map origin
-        robot_pose_in_map = Pose3::Identity();
-        RCLCPP_INFO(this->get_logger(), "Initializing fiducial %d with robot at map origin", fiducial_id);
+        RCLCPP_WARN(this->get_logger(), "Robot pose not available for fiducial initialization, using last odometry");
+        robot_pose_in_map = last_odom_pose_;
       }
       
-      // Need to transform camera_to_fiducial through base_link to get proper map coordinates
-      // First get camera pose relative to base_link
-      Pose3 base_to_camera = Pose3::Identity(); // Simplified - assumes camera at base_link
+      // Get camera pose relative to base_link
+      Pose3 base_to_camera = Pose3::Identity();
       
-      // Try to get actual transform from base to camera if available
       try {
         if (tf_buffer_->canTransform(base_frame_, camera_frame_, rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1))) {
           auto base_to_camera_tf = tf_buffer_->lookupTransform(
@@ -391,27 +402,76 @@ private:
       }
       
       // Calculate fiducial position in map frame
-      // fiducial_in_map = robot_in_map * base_to_camera * camera_to_fiducial
       Pose3 fiducial_pose = robot_pose_in_map * base_to_camera * camera_to_fiducial;
       
       Symbol fiducial_key = Symbol('l', fiducial_id);
       initial_estimate_.insert(fiducial_key, fiducial_pose);
       known_fiducials_.insert(fiducial_id);
       
-      // Add strong prior constraint for the first few fiducials to anchor the map
-      // This prevents the entire map from drifting
-      if (known_fiducials_.size() <= 3) {
-        graph_.add(PriorFactor<Pose3>(fiducial_key, fiducial_pose, fiducial_prior_noise_));
-        RCLCPP_INFO(this->get_logger(), "Added anchor prior for fiducial %d (anchor #%zu)", 
-                    fiducial_id, known_fiducials_.size());
-      }
-      
-      RCLCPP_INFO(this->get_logger(), "Initialized new fiducial %d in map frame at position [%.2f, %.2f, %.2f]",
+      RCLCPP_INFO(this->get_logger(), "Initialized new fiducial %d at position [%.2f, %.2f, %.2f]",
                   fiducial_id, fiducial_pose.x(), fiducial_pose.y(), fiducial_pose.z());
                   
     } catch (const std::exception& ex) {
       RCLCPP_WARN(this->get_logger(), "Exception in fiducial initialization: %s", ex.what());
     }
+  }
+  
+  void initializeMapOrigin(int first_fiducial_id, const Pose3& camera_to_fiducial) {
+    RCLCPP_INFO(this->get_logger(), "Initializing map origin with first fiducial %d", first_fiducial_id);
+    
+    // Get the current robot pose from odometry if available
+    Pose3 robot_pose_at_map_origin = Pose3::Identity();
+    
+    if (has_received_odom_) {
+      robot_pose_at_map_origin = last_odom_pose_;
+      RCLCPP_INFO(this->get_logger(), "Using odometry pose as map origin: [%.2f, %.2f, %.2f]", 
+                  robot_pose_at_map_origin.x(), robot_pose_at_map_origin.y(), robot_pose_at_map_origin.z());
+    } else {
+      RCLCPP_INFO(this->get_logger(), "No odometry available, using identity as map origin");
+    }
+    
+    // Store reference Z for constraints
+    reference_z_ = robot_pose_at_map_origin.z();
+    
+    // Add the robot pose to the graph with a strong prior (this establishes the map origin)
+    auto tight_prior_noise = noiseModel::Diagonal::Variances(
+      (Vector(6) << 0.001, 0.001, 0.001, 0.001, 0.001, 0.001).finished());
+    graph_.add(PriorFactor<Pose3>(current_robot_key_, robot_pose_at_map_origin, tight_prior_noise));
+    current_estimate_.insert(current_robot_key_, robot_pose_at_map_origin);
+    
+    // Add constraints for the robot pose
+    addRollPitchConstraint(current_robot_key_);
+    addZConstraint(current_robot_key_);
+    
+    // Get camera pose relative to base_link
+    Pose3 base_to_camera = Pose3::Identity();
+    
+    try {
+      if (tf_buffer_->canTransform(base_frame_, camera_frame_, rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1))) {
+        auto base_to_camera_tf = tf_buffer_->lookupTransform(
+          base_frame_, camera_frame_, rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1));
+        base_to_camera = rosToPose3(base_to_camera_tf.transform);
+      }
+    } catch (const tf2::TransformException& ex) {
+      RCLCPP_DEBUG(this->get_logger(), "Using identity for base->camera transform: %s", ex.what());
+    }
+    
+    // Calculate first fiducial position in the new map frame
+    Pose3 fiducial_pose = robot_pose_at_map_origin * base_to_camera * camera_to_fiducial;
+    
+    Symbol fiducial_key = Symbol('l', first_fiducial_id);
+    initial_estimate_.insert(fiducial_key, fiducial_pose);
+    current_estimate_.insert(fiducial_key, fiducial_pose);
+    known_fiducials_.insert(first_fiducial_id);
+    
+    // Add a strong prior for the first fiducial to anchor the map
+    graph_.add(PriorFactor<Pose3>(fiducial_key, fiducial_pose, fiducial_prior_noise_));
+    
+    map_initialized_ = true;
+    
+    RCLCPP_INFO(this->get_logger(), "Map origin established! Robot at [%.2f, %.2f, %.2f], first fiducial %d at [%.2f, %.2f, %.2f]",
+                robot_pose_at_map_origin.x(), robot_pose_at_map_origin.y(), robot_pose_at_map_origin.z(),
+                first_fiducial_id, fiducial_pose.x(), fiducial_pose.y(), fiducial_pose.z());
   }
   
   void odometryCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
@@ -422,11 +482,19 @@ private:
       last_odom_pose_ = rosToPose3(msg->pose.pose);
       has_received_odom_ = true;
       
-      // Update reference Z from first odometry message if available
+      // Update reference Z from first odometry message if available and map not yet initialized
       if (reference_z_ == 0.0) {
         reference_z_ = last_odom_pose_.z();
         RCLCPP_INFO(this->get_logger(), "Set reference Z to %.3f from first odometry", reference_z_);
       }
+      return;
+    }
+    
+    // If map hasn't been initialized yet, just track odometry but don't add to graph
+    if (!map_initialized_) {
+      last_odom_time_ = msg->header.stamp;
+      last_odom_pose_ = rosToPose3(msg->pose.pose);
+      RCLCPP_DEBUG(this->get_logger(), "Tracking odometry, waiting for map initialization");
       return;
     }
     
@@ -446,12 +514,19 @@ private:
     addZConstraint(new_robot_key);
     
     // Initialize new pose estimate
+    Pose3 prev_pose;
     if (current_estimate_.exists(current_robot_key_)) {
-      Pose3 prev_pose = current_estimate_.at<Pose3>(current_robot_key_);
-      initial_estimate_.insert(new_robot_key, prev_pose * odom_delta);
+      prev_pose = current_estimate_.at<Pose3>(current_robot_key_);
+    } else if (initial_estimate_.exists(current_robot_key_)) {
+      // Fall back to initial estimate if not in current estimate yet
+      prev_pose = initial_estimate_.at<Pose3>(current_robot_key_);
     } else {
-      initial_estimate_.insert(new_robot_key, current_odom_pose);
+      // This shouldn't happen if map is initialized, but handle gracefully
+      RCLCPP_WARN(this->get_logger(), "Previous robot pose not found in estimates, using current odometry");
+      prev_pose = last_odom_pose_;
     }
+    
+    initial_estimate_.insert(new_robot_key, prev_pose * odom_delta);
     
     current_robot_key_ = new_robot_key;
     last_odom_time_ = msg->header.stamp;
@@ -462,6 +537,12 @@ private:
     std::lock_guard<std::mutex> lock(graph_mutex_);
     
     RCLCPP_DEBUG(this->get_logger(), "Optimization callback started");
+    
+    // Only optimize if the map has been initialized
+    if (!map_initialized_) {
+      RCLCPP_DEBUG(this->get_logger(), "Skipping optimization - map not yet initialized");
+      return;
+    }
     
     // Only optimize if we have received at least one odometry message and have sufficient data
     if (graph_.empty() || current_estimate_.empty() || !has_received_odom_) {
@@ -753,7 +834,31 @@ private:
     }
     
     file.close();
-    RCLCPP_INFO(this->get_logger(), "Loaded %zu fiducials from map file in localization mode", known_fiducials_.size());
+    
+    if (!known_fiducials_.empty()) {
+      // In localization mode, the map is considered initialized when we load existing fiducials
+      map_initialized_ = true;
+      
+      // Still need to initialize the robot pose when first odometry/fiducial observation comes in
+      // But we can add a loose prior for the robot at origin until then
+      Pose3 initial_pose = Pose3::Identity();
+      current_robot_key_ = Symbol('x', 0);
+      
+      // Add loose prior for robot pose - will be updated when first observation comes in
+      auto loose_prior_noise = noiseModel::Diagonal::Variances(
+        (Vector(6) << 1.0, 1.0, 1.0, 0.1, 0.1, 1.0).finished());
+      graph_.add(PriorFactor<Pose3>(current_robot_key_, initial_pose, loose_prior_noise));
+      current_estimate_.insert(current_robot_key_, initial_pose);
+      
+      // Add constraints for the initial pose
+      reference_z_ = initial_pose.z();
+      addRollPitchConstraint(current_robot_key_);
+      addZConstraint(current_robot_key_);
+      
+      RCLCPP_INFO(this->get_logger(), "Loaded %zu fiducials from map file - localization mode ready", known_fiducials_.size());
+    } else {
+      RCLCPP_WARN(this->get_logger(), "No fiducials loaded from map file");
+    }
   }
   
   void saveFiducialMap() {
@@ -826,6 +931,7 @@ private:
   double max_roll_pitch_degrees_;
   double max_z_deviation_meters_;
   double reference_z_ = 0.0;  // Reference Z height for constraints
+  bool map_initialized_ = false;  // Track whether map origin has been established
   
   // Noise parameters
   double fiducial_pos_noise_;
