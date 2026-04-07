@@ -68,7 +68,7 @@ void Fiducial::update(const tf2::Stamped<TransformWithVariance> &newPose) {
 Fiducial::Fiducial(int id, const tf2::Stamped<TransformWithVariance> &pose) {
     this->id = id;
     this->pose = pose;
-    this->lastPublished = rclcpp::Time(0);
+    this->lastPublished = rclcpp::Time(0, 0, RCL_ROS_TIME);
     this->numObs = 0;
     this->visible = false;
 }
@@ -201,85 +201,81 @@ void Map::update(std::vector<Observation> &obs, const rclcpp::Time &time) {
     if (isInitializingMap) {
         autoInit(obs, time);
     } else {
+        // cameraPose is the camera pose in map frame (T_map_cam)
         tf2::Stamped<TransformWithVariance> cameraPose;
         cameraPose.frame_id_ = mapFrame;
         cameraPose.stamp_ = tf2_ros::fromMsg(time);
         cameraPose.variance = 0.0;
 
-        if (updatePose(obs, time, cameraPose) > 0 && obs.size() > 1 && !readOnly) {
-            updateMap(obs, time, cameraPose);
-            
+        if (updatePose(obs, time, cameraPose) > 0) {
+            // Update map with observations (cameraPose needed to compute fiducial positions)
+            if (!readOnly) {
+                updateMap(obs, time, cameraPose);
+            }
+
             // Publish the camera's pose
             geometry_msgs::msg::PoseWithCovarianceStamped cameraPoseMsg;
             cameraPoseMsg.header.frame_id = mapFrame;
-            cameraPoseMsg.header.stamp = time; // Use the observation time
+            cameraPoseMsg.header.stamp = time;
             cameraPoseMsg.pose.pose = toPose(cameraPose.transform);
-            
-            // Convert variance to covariance matrix
             for (int i = 0; i < 36; i++) {
                 cameraPoseMsg.pose.covariance[i] = 0;
             }
-            cameraPoseMsg.pose.covariance[0] = cameraPoseMsg.pose.covariance[7] = 
-                cameraPoseMsg.pose.covariance[14] = 
-                cameraPoseMsg.pose.covariance[21] = cameraPoseMsg.pose.covariance[28] = 
+            cameraPoseMsg.pose.covariance[0] = cameraPoseMsg.pose.covariance[7] =
+                cameraPoseMsg.pose.covariance[14] =
+                cameraPoseMsg.pose.covariance[21] = cameraPoseMsg.pose.covariance[28] =
                     cameraPoseMsg.pose.covariance[35] = cameraPose.variance;
-            
             cameraPosePub->publish(cameraPoseMsg);
 
-            // Compute robot pose
-            tf2::Transform T_baseCam;
-            if (lookupTransform(baseFrame, obs[0].T_camFid.frame_id_, time, T_baseCam)) {
-                tf2::Transform robot_pose_tf = cameraPose.transform * T_baseCam;
-                
-                // Create and publish robot pose message
+            // Compute robot base pose: T_map_base = T_map_cam * T_cam_base
+            // lookupTransform(cam, base) returns T such that p_cam = T * p_base
+            tf2::Transform T_camBase;
+            if (lookupTransform(obs[0].T_camFid.frame_id_, baseFrame, rclcpp::Time(0, 0, RCL_ROS_TIME), T_camBase)) {
+                tf2::Transform robot_pose_tf = cameraPose.transform * T_camBase;
+
+                // Publish robot pose
                 geometry_msgs::msg::PoseWithCovarianceStamped robotPoseMsg;
                 robotPoseMsg.header.frame_id = mapFrame;
-                robotPoseMsg.header.stamp = time; // Use the observation time
+                robotPoseMsg.header.stamp = time;
                 robotPoseMsg.pose.pose = toPose(robot_pose_tf);
-                
-                // Set covariance
                 for (int i = 0; i < 36; i++) {
                     robotPoseMsg.pose.covariance[i] = 0;
                 }
-                robotPoseMsg.pose.covariance[0] = robotPoseMsg.pose.covariance[7] = 
-                    robotPoseMsg.pose.covariance[14] = 
-                    robotPoseMsg.pose.covariance[21] = robotPoseMsg.pose.covariance[28] = 
+                robotPoseMsg.pose.covariance[0] = robotPoseMsg.pose.covariance[7] =
+                    robotPoseMsg.pose.covariance[14] =
+                    robotPoseMsg.pose.covariance[21] = robotPoseMsg.pose.covariance[28] =
                         robotPoseMsg.pose.covariance[35] = cameraPose.variance;
-                
                 if (overridePublishedCovariance) {
                     for (int i = 0; i < 6; i++) {
                         robotPoseMsg.pose.covariance[i * 7] = covarianceDiagonal[i];
                     }
                 }
-
                 robotPosePub->publish(robotPoseMsg);
+                RCLCPP_INFO(logger, "Published robot pose: x=%.3f y=%.3f z=%.3f",
+                            robotPoseMsg.pose.pose.position.x,
+                            robotPoseMsg.pose.pose.position.y,
+                            robotPoseMsg.pose.pose.position.z);
 
                 // TF publishing
-                if (publishPoseTf) { 
+                if (publishPoseTf) {
                     geometry_msgs::msg::TransformStamped tf_msg;
-                    // Stamp will be updated before sending by the periodic publishTf or the Map::update() loop
                     tf_msg.header.frame_id = mapFrame;
-                    // Default to publishing map -> base_frame
                     tf2::Transform transform_to_publish = robot_pose_tf;
                     std::string child_frame_to_publish = baseFrame;
 
                     if (!odomFrame.empty()) {
                         tf2::Transform T_odomBase;
-                        // Lookup transform from odom to base_frame at the current time
                         if (lookupTransform(odomFrame, baseFrame, time, T_odomBase)) {
-                            // Transform map -> base_frame to map -> odom
-                            // T_mapOdom = T_mapBase * T_baseOdom (where T_baseOdom is T_odomBase.inverse())
+                            // T_map_odom = T_map_base * T_base_odom
                             transform_to_publish = robot_pose_tf * T_odomBase.inverse();
                             child_frame_to_publish = odomFrame;
                         } else {
-                            RCLCPP_WARN(logger, "Could not lookup %s to %s transform. Publishing map->%s instead of map->%s", 
-                                        odomFrame.c_str(), baseFrame.c_str(), baseFrame.c_str(), odomFrame.c_str());
-                            // Fallback to publishing map->base_frame if odom->base_frame is not available
+                            RCLCPP_WARN(logger, "Could not lookup %s to %s. Publishing map->%s",
+                                        odomFrame.c_str(), baseFrame.c_str(), baseFrame.c_str());
                         }
                     }
 
-                    // Make outgoing transform make sense - ie only consist of x, y, yaw
-                    // This can be disabled via the publish_6dof_pose param, mainly for debugging
+                    // Flatten to 2D (x, y, yaw) unless 6DOF mode
                     if (!publish_6dof_pose) {
                         tf2::Vector3 translation = transform_to_publish.getOrigin();
                         translation.setZ(0);
@@ -291,8 +287,7 @@ void Map::update(std::vector<Observation> &obs, const rclcpp::Time &time) {
 
                     tf_msg.child_frame_id = child_frame_to_publish;
                     tf_msg.transform = tf2::toMsg(transform_to_publish);
-                    
-                    poseTf = tf_msg; // Store the latest calculated TF
+                    poseTf = tf_msg;
                     havePose = true;
                 }
             }
@@ -386,31 +381,22 @@ void Map::autoInit(const std::vector<Observation> &obs, const rclcpp::Time &time
 } // End Map::autoInit
 
 // Implementation for updatePose
+// Returns the camera pose in map frame (T_map_cam) via cameraPose reference.
+// Uses base pose for validity checks (ground robot should be near z=0, level).
 int Map::updatePose(std::vector<Observation> &obs, const rclcpp::Time &time,
                    tf2::Stamped<TransformWithVariance> &cameraPose) {
     int numEsts = 0;
-    tf2::Stamped<TransformWithVariance> T_camBase;
-    tf2::Stamped<TransformWithVariance> T_baseCam;
-    tf2::Stamped<TransformWithVariance> T_mapBase;
 
     if (obs.size() == 0) {
         return 0;
     }
 
-
-    if (lookupTransform(obs[0].T_camFid.frame_id_, baseFrame, time, T_camBase.transform)) {
-        tf2::Vector3 c = T_camBase.transform.getOrigin();
-        T_camBase.variance = 1.0;
-    } else {
-        RCLCPP_ERROR(logger, "Cannot determine tf from camera to robot");
-        return 0;
-    }
-
-    if (lookupTransform(baseFrame, obs[0].T_camFid.frame_id_, time, T_baseCam.transform)) {
-        tf2::Vector3 c = T_baseCam.transform.getOrigin();
-        T_baseCam.variance = 1.0;
-    } else {
-        RCLCPP_ERROR(logger, "Cannot determine tf from robot to camera");
+    // Look up camera-to-base transform for validity checking
+    // Use time(0) for static transforms to avoid sim-time issues
+    tf2::Transform T_camBase;
+    if (!lookupTransform(obs[0].T_camFid.frame_id_, baseFrame, rclcpp::Time(0, 0, RCL_ROS_TIME), T_camBase)) {
+        RCLCPP_ERROR(logger, "Cannot determine tf from %s to %s",
+                     obs[0].T_camFid.frame_id_.c_str(), baseFrame.c_str());
         return 0;
     }
 
@@ -418,95 +404,55 @@ int Map::updatePose(std::vector<Observation> &obs, const rclcpp::Time &time,
         if (fiducials.find(o.fid) != fiducials.end()) {
             const Fiducial &fid = fiducials[o.fid];
 
-            // Create proper stamped transform
+            // Camera pose in map: T_map_cam = T_map_fid * T_fid_cam
             tf2::Stamped<TransformWithVariance> p = fid.pose * o.T_fidCam;
             p.frame_id_ = mapFrame;
             p.stamp_ = o.T_fidCam.stamp_;
-            
-            // Apply the camera->base transform
-            TransformWithVariance combined = TransformWithVariance(
-                p.transform * T_camBase.transform,
-                p.variance + T_camBase.variance
-            );
-            p.setData(combined);
-            auto position = p.transform.getOrigin();
-            double roll, pitch, yaw;
-            p.transform.getBasis().getRPY(roll, pitch, yaw);
 
-            // Create variance according to how well the robot is upright on the ground
+            // Compute base pose for validity checks: T_map_base = T_map_cam * T_cam_base
+            tf2::Transform basePoseT = p.transform * T_camBase;
+            auto basePos = basePoseT.getOrigin();
+            double baseRoll, basePitch, baseYaw;
+            basePoseT.getBasis().getRPY(baseRoll, basePitch, baseYaw);
+
+            // Variance based on how well the robot base is on the ground
             auto cam_f = o.T_camFid.transform.getOrigin();
-            double s1 = std::pow(position.z() / cam_f.z(), 2) *
+            double cam_f_z = cam_f.z();
+            if (std::abs(cam_f_z) < 0.01) cam_f_z = 0.01; // avoid division by zero
+            double s1 = std::pow(basePos.z() / cam_f_z, 2) *
                         (std::pow(cam_f.x(), 2) + std::pow(cam_f.y(), 2));
-            double s2 = position.length2() * std::pow(std::sin(roll), 2);
-            double s3 = position.length2() * std::pow(std::sin(pitch), 2);
-            p.variance = s1 + s2 + s3 + map_systematic_error; // Use member variable
+            double s2 = basePos.length2() * std::pow(std::sin(baseRoll), 2);
+            double s3 = basePos.length2() * std::pow(std::sin(basePitch), 2);
+            p.variance = s1 + s2 + s3 + map_systematic_error;
             o.T_camFid.variance = p.variance;
 
-            // Determine if this is a good estimate
+            // Validate using base pose (robot should be near ground, roughly level)
             bool valid = true;
-            if (std::isnan(position.x()) || std::isnan(position.y()) || std::isnan(position.z())) {
+            if (std::isnan(basePos.x()) || std::isnan(basePos.y()) || std::isnan(basePos.z())) {
                 valid = false;
-                RCLCPP_WARN(logger, "Skipping NAN estimate");
-            } else if (position.z() > 10.0) {
+                RCLCPP_WARN(logger, "Skipping NAN estimate for fiducial %d", o.fid);
+            } else if (std::abs(basePos.z()) > 2.0) {
                 valid = false;
-                RCLCPP_WARN(logger, "Skipping estimate with high Z");
-            //} else if (std::abs(std::abs(roll) - M_PI) > 1.5 || std::abs(std::abs(pitch) - M_PI) > 1.5) {
-              //  valid = false;
-              //  RCLCPP_WARN(logger, "Skipping estimate with high roll/pitch");
-            } else if (p.variance > 10.0) {
+                RCLCPP_WARN(logger, "Skipping estimate with base Z=%.2f for fiducial %d",
+                            basePos.z(), o.fid);
+            } else if (std::abs(baseRoll) > 0.8 || std::abs(basePitch) > 0.8) {
                 valid = false;
-                RCLCPP_WARN(logger, "Skipping estimate with high variance: %f", p.variance);
+                RCLCPP_WARN(logger, "Skipping estimate with base roll=%.2f pitch=%.2f for fiducial %d",
+                            baseRoll, basePitch, o.fid);
             }
 
             if (valid) {
-                // Convert the camera pose into the base pose
-                tf2::Stamped<TransformWithVariance> basePose = p;
                 numEsts++;
-
                 if (cameraPose.variance == 0.0) {
                     cameraPose = p;
                 } else {
-                    // Calculate the transform between the current cameraPose and p
-                    TransformWithVariance diff = TransformWithVariance(
-                        cameraPose.transform.inverse() * p.transform,
-                        cameraPose.variance + p.variance
-                    );
-                    cameraPose.setData(diff);
+                    // Weighted merge of camera pose estimates
                     cameraPose.update(p);
                 }
             }
         }
     }
 
-    if (numEsts == 0) {
-        return 0;
-    }
-
-    // Apply temporal smoothing to reduce pose jumps
-    if (previousCameraPose.variance > 0.0) {
-        double smoothingFactor = 0.0; // Adjust this for more/less smoothing (0.0 = no smoothing, 1.0 = no update)
-        
-        // Smooth position
-        tf2::Vector3 currentPos = cameraPose.transform.getOrigin();
-        tf2::Vector3 previousPos = previousCameraPose.transform.getOrigin();
-        tf2::Vector3 smoothedPos = previousPos.lerp(currentPos, smoothingFactor);
-        
-        // Smooth rotation using slerp
-        tf2::Quaternion currentRot = cameraPose.transform.getRotation();
-        tf2::Quaternion previousRot = previousCameraPose.transform.getRotation();
-        tf2::Quaternion smoothedRot = previousRot.slerp(currentRot, smoothingFactor);
-        
-        // Apply smoothed transform
-        cameraPose.transform.setOrigin(smoothedPos);
-        cameraPose.transform.setRotation(smoothedRot);
-        
-        RCLCPP_DEBUG(logger, "Applied pose smoothing");
-    }
-    
-    // Store current pose as previous for next iteration
-    previousCameraPose = cameraPose;
-
-    // Publish updated transform and update the robot's position in the map
     return numEsts;
 }
 
@@ -612,7 +558,9 @@ void Map::publishMarkers() {
     rclcpp::Time now = node->now();
     for (auto &fiducial_pair : fiducials) {
         Fiducial &f = fiducial_pair.second;
-        if ((now - f.lastPublished).seconds() > 1.0 || f.lastPublished.seconds() == 0) { // Publish if older than 1s or never
+        // Use nanoseconds check to avoid time source mismatch on subtraction
+        if (f.lastPublished.nanoseconds() == 0 ||
+            (now.nanoseconds() - f.lastPublished.nanoseconds()) > 1000000000LL) {
             publishMarker(f);
         }
     }
